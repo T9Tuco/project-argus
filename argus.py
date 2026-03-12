@@ -70,6 +70,52 @@ def _bail_no_privs(action: str) -> None:
     sys.exit(1)
 
 
+def _resolve_target(raw: str, expect_network: bool = False) -> str:
+    """
+    Normalise user input to a bare IP or CIDR string.
+    Strips URL schemes/paths, resolves hostnames, rejects garbage early.
+    """
+    import urllib.parse
+
+    # strip scheme + path so "https://example.com/foo" → "example.com"
+    if "://" in raw:
+        parsed = urllib.parse.urlparse(raw)
+        raw = parsed.hostname or raw
+    else:
+        # "example.com/24" could be a typo for CIDR — keep it, let the
+        # network parse fail with a clean message below
+        raw = raw.strip()
+
+    # if it already looks like a valid IP or CIDR, return as-is
+    if expect_network:
+        try:
+            ipaddress.ip_network(raw, strict=False)
+            return raw
+        except ValueError:
+            pass
+    else:
+        try:
+            ipaddress.ip_address(raw)
+            return raw
+        except ValueError:
+            pass
+
+    # try DNS resolution — handles plain hostnames and domain names
+    # only makes sense for single-host targets, not CIDR ranges
+    if expect_network:
+        console.print(f"[bold red]Invalid target:[/bold red] [white]{raw!r}[/white] is not a valid IP or CIDR range.\n"
+                      f"[dim]Examples: 192.168.1.0/24, 10.0.0.0/8[/dim]")
+        sys.exit(1)
+
+    try:
+        resolved = socket.gethostbyname(raw)
+        console.print(f"[dim]{raw} → {resolved}[/dim]")
+        return resolved
+    except socket.gaierror:
+        console.print(f"[bold red]Invalid target:[/bold red] [white]{raw!r}[/white] — not an IP and DNS resolution failed.")
+        sys.exit(1)
+
+
 def _is_local(target: str) -> bool:
     for p in ("10.", "172.16.", "172.17.", "172.18.", "172.19.",
               "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
@@ -414,6 +460,7 @@ def _show_latency(stats: LatencyStats) -> None:
 # ---------------------------------------------------------------------------
 
 def cmd_discover(args: argparse.Namespace) -> None:
+    args.target = _resolve_target(args.target, expect_network=True)
     _bail_no_privs("Host discovery")
     _banner()
     with console.status("[bold cyan]Scanning network...[/bold cyan]", spinner="dots"):
@@ -427,6 +474,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
 
 def cmd_scan(args: argparse.Namespace) -> None:
     _banner()
+    args.target = _resolve_target(args.target, expect_network=False)
     port_list = None
     if args.ports:
         try:
@@ -473,6 +521,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
 
 
 def cmd_ping(args: argparse.Namespace) -> None:
+    args.target = _resolve_target(args.target, expect_network=False)
     _bail_no_privs("ICMP ping")
     _banner()
 
@@ -515,6 +564,7 @@ def cmd_ping(args: argparse.Namespace) -> None:
 
 
 def cmd_monitor(args: argparse.Namespace) -> None:
+    args.target = _resolve_target(args.target, expect_network=True)
     _bail_no_privs("Network monitoring")
     _banner()
     console.print(f"[dim]Monitoring [bold]{args.target}[/bold] every {args.interval}s — Ctrl+C to stop[/dim]\n")
