@@ -394,6 +394,7 @@ def _banner() -> None:
         "  \\ \\ \\/\\ \\ \\ \\\\ \\\\ \\ \\/, \\ \\ \\_\\ \\/\\ \\L\\ \\",
         "   \\ \\_\\ \\_\\ \\_\\ \\_\\ \\____/\\ \\_____\\ `\\____\\",
         "    \\/_/\\/_/\\/_/\\/ /\\/___/  \\/_____/\\/_____/",
+        "      made by TucoT9 | https://github.com/t9tuco/project-argus",
     ]
     txt = Text()
     for i, line in enumerate(lines):
