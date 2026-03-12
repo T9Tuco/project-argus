@@ -1,0 +1,19 @@
+#!/bin/bash
+# wrapper to run argus.py from anywhere
+# install: sudo cp argus /usr/local/bin/ && sudo chmod +x /usr/local/bin/argus
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+
+if [ -f "$SCRIPT_DIR/argus.py" ]; then
+    exec python3 "$SCRIPT_DIR/argus.py" "$@"
+fi
+
+# fallback:
+REAL_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+if [ -f "$REAL_DIR/argus.py" ]; then
+    exec python3 "$REAL_DIR/argus.py" "$@"
+fi
+
+echo "error: can't find argus.py"
+exit 1

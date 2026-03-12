@@ -3,15 +3,17 @@
 Project Argus — network scanner and monitor.
 
 Usage:
-    python argus.py discover <network>
-    python argus.py scan <target> [--deep] [-p 22,80,443]
-    python argus.py ping <target> [-c 10]
-    python argus.py monitor <network>
+    argus                                  # interactive mode
+    argus discover <network>
+    argus scan <target> [--deep] [-p 22,80-100,443]
+    argus ping <target> [-c 10]
+    argus monitor <network>
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import ipaddress
 import json as json_mod
 import os
@@ -19,6 +21,7 @@ import platform
 import socket
 import sys
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -34,12 +37,15 @@ try:
     from rich.console import Console
     from rich.table import Table
     from rich.panel import Panel
+    from rich.prompt import Prompt, IntPrompt, Confirm
     from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
     from rich.text import Text
     console = Console()
 except ImportError:
     print("missing dependency: pip install rich")
     sys.exit(1)
+
+MAX_THREADS = 50
 
 
 # ---------------------------------------------------------------------------
@@ -62,68 +68,58 @@ def _bail_no_privs(action: str) -> None:
     system = platform.system()
     if system == "Windows":
         hint = "Run the terminal as Administrator."
-    elif system == "Darwin":
-        hint = "Run with: sudo python argus.py ..."
     else:
-        hint = "Run with: sudo python argus.py ..."
+        hint = "Run with: sudo argus ..."
     console.print(f"\n[bold red]Need root:[/bold red] {action} requires raw sockets.\n[dim]{hint}[/dim]\n")
     sys.exit(1)
 
 
 def _resolve_target(raw: str, expect_network: bool = False) -> str:
     """
-    Normalise user input to a bare IP or CIDR string.
-    Strips URL schemes/paths, resolves hostnames, rejects garbage early.
+    Normalise user input to an IP or CIDR string.
+    Strips URL schemes/paths, resolves hostnames.
     """
-    import urllib.parse
-
-    # strip scheme + path so "https://example.com/foo" → "example.com"
     if "://" in raw:
         parsed = urllib.parse.urlparse(raw)
         raw = parsed.hostname or raw
     else:
-        # "example.com/24" could be a typo for CIDR — keep it, let the
-        # network parse fail with a clean message below
         raw = raw.strip()
 
-    # if it already looks like a valid IP or CIDR, return as-is
     if expect_network:
         try:
             ipaddress.ip_network(raw, strict=False)
             return raw
         except ValueError:
             pass
-    else:
-        try:
-            ipaddress.ip_address(raw)
-            return raw
-        except ValueError:
-            pass
-
-    # try DNS resolution — handles plain hostnames and domain names
-    # only makes sense for single-host targets, not CIDR ranges
-    if expect_network:
-        console.print(f"[bold red]Invalid target:[/bold red] [white]{raw!r}[/white] is not a valid IP or CIDR range.\n"
+        console.print(f"[bold red]Invalid target:[/bold red] [white]{raw!r}[/white] is not a valid CIDR range.\n"
                       f"[dim]Examples: 192.168.1.0/24, 10.0.0.0/8[/dim]")
         sys.exit(1)
+
+    try:
+        ipaddress.ip_address(raw)
+        return raw
+    except ValueError:
+        pass
 
     try:
         resolved = socket.gethostbyname(raw)
         console.print(f"[dim]{raw} → {resolved}[/dim]")
         return resolved
     except socket.gaierror:
-        console.print(f"[bold red]Invalid target:[/bold red] [white]{raw!r}[/white] — not an IP and DNS resolution failed.")
+        console.print(f"[bold red]Invalid target:[/bold red] [white]{raw!r}[/white] — not an IP and DNS lookup failed.")
         sys.exit(1)
 
 
 def _is_local(target: str) -> bool:
-    for p in ("10.", "172.16.", "172.17.", "172.18.", "172.19.",
-              "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
-              "172.25.", "172.26.", "172.27.", "172.28.", "172.29.",
-              "172.30.", "172.31.", "192.168.", "169.254."):
-        if target.startswith(p):
-            return True
-    return False
+    """Check if a network/ip falls within private address space."""
+    try:
+        net = ipaddress.ip_network(target, strict=False)
+        return net.is_private and not net.is_loopback
+    except ValueError:
+        try:
+            return ipaddress.ip_address(target).is_private
+        except ValueError:
+            return False
 
 
 def _os_from_ttl(ttl: int) -> str:
@@ -134,6 +130,37 @@ def _os_from_ttl(ttl: int) -> str:
     if ttl <= 128:
         return "Windows"
     return "network device"
+
+
+def _parse_ports(spec: str) -> list[int]:
+    """
+    Parse port specification: '22,80,100-200,443'
+    Supports individual ports and ranges.
+    """
+    ports = []
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            try:
+                lo, hi = part.split("-", 1)
+                lo, hi = int(lo), int(hi)
+                if lo > hi or lo < 1 or hi > 65535:
+                    console.print(f"[red]Bad port range: {part}[/red]")
+                    sys.exit(1)
+                ports.extend(range(lo, hi + 1))
+            except ValueError:
+                console.print(f"[red]Bad port range: {part}[/red]")
+                sys.exit(1)
+        else:
+            try:
+                p = int(part)
+                if p < 1 or p > 65535:
+                    raise ValueError
+                ports.append(p)
+            except ValueError:
+                console.print(f"[red]Bad port: {part}[/red]")
+                sys.exit(1)
+    return sorted(set(ports))
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +204,7 @@ class PortResult:
     state: PortState
     service: str = ""
     rtt_ms: float = 0.0
+    banner: str = ""
 
 
 @dataclass
@@ -236,28 +264,34 @@ def _arp_sweep(network: str, timeout: float = 2.0) -> list[Host]:
     return hosts
 
 
-def _ping_host(ip: str, timeout: float, retries: int) -> Host:
+def _ping_one(ip: str, timeout: float, retries: int) -> Optional[Host]:
     host = Host(ip=ip)
     for _ in range(1 + retries):
         pkt = IP(dst=ip) / ICMP()
         start = time.perf_counter()
         reply = sr1(pkt, timeout=timeout)
         elapsed = (time.perf_counter() - start) * 1000
-        if reply is not None:
+        if reply is not None and reply.haslayer(ICMP) and reply[ICMP].type == 0:
             host.alive = True
             host.rtt_ms.append(elapsed)
             host.ttl = reply.ttl
-            break
-    return host
+            return host
+    return None
 
 
-def _ping_sweep(network: str, timeout: float = 2.0, retries: int = 1) -> list[Host]:
+def _ping_sweep_threaded(network: str, timeout: float = 2.0, retries: int = 1) -> list[Host]:
     net = ipaddress.ip_network(network, strict=False)
-    hosts = []
-    for addr in net.hosts():
-        h = _ping_host(str(addr), timeout, retries)
-        if h.alive:
-            hosts.append(h)
+    addrs = [str(a) for a in net.hosts()]
+    hosts: list[Host] = []
+
+    # scapy isn't fully thread-safe for sr1, but for independent
+    # packets to different IPs it works fine in practice
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as pool:
+        futures = {pool.submit(_ping_one, ip, timeout, retries): ip for ip in addrs}
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result and result.alive:
+                hosts.append(result)
     return hosts
 
 
@@ -270,7 +304,7 @@ def discover_hosts(network: str, timeout: float = 2.0, retries: int = 1) -> list
     if _is_root() and _is_local(network):
         hosts = _arp_sweep(network, timeout=timeout)
     if not hosts and _is_root():
-        hosts = _ping_sweep(network, timeout=timeout, retries=retries)
+        hosts = _ping_sweep_threaded(network, timeout=timeout, retries=retries)
     return hosts
 
 
@@ -285,66 +319,88 @@ def _resolve_service(port: int) -> str:
         return ""
 
 
-def _syn_scan(target: str, ports: list[int], timeout: float = 2.0) -> list[PortResult]:
-    results = []
-    for port in ports:
-        pkt = IP(dst=target) / TCP(dport=port, flags="S")
-        start = time.perf_counter()
-        reply = sr1(pkt, timeout=timeout)
-        elapsed = (time.perf_counter() - start) * 1000
+def _grab_banner(ip: str, port: int, timeout: float = 2.0) -> str:
+    """Try to grab a service banner from an open port."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((ip, port))
+        s.sendall(b"\r\n")
+        data = s.recv(256)
+        s.close()
+        return data.decode("utf-8", errors="replace").strip()[:80]
+    except Exception:
+        return ""
 
-        if reply is None:
-            state = PortState.FILTERED
-        elif reply.haslayer(TCP):
-            flags = reply[TCP].flags
-            if flags & 0x12:  # SYN-ACK
-                state = PortState.OPEN
-                sr1(IP(dst=target) / TCP(dport=port, flags="R"), timeout=0.5)
-            elif flags & 0x04:  # RST
-                state = PortState.CLOSED
-            else:
-                state = PortState.FILTERED
+
+def _scan_single_syn(target: str, port: int, timeout: float) -> PortResult:
+    pkt = IP(dst=target) / TCP(dport=port, flags="S")
+    start = time.perf_counter()
+    reply = sr1(pkt, timeout=timeout)
+    elapsed = (time.perf_counter() - start) * 1000
+
+    if reply is None:
+        state = PortState.FILTERED
+    elif reply.haslayer(TCP):
+        flags = reply[TCP].flags
+        if flags & 0x12:  # SYN-ACK
+            state = PortState.OPEN
+            sr1(IP(dst=target) / TCP(dport=port, flags="R"), timeout=0.5)
+        elif flags & 0x04:  # RST
+            state = PortState.CLOSED
         else:
             state = PortState.FILTERED
-
-        results.append(PortResult(port=port, state=state, service=_resolve_service(port), rtt_ms=elapsed))
-    return results
-
-
-def _connect_scan(target: str, ports: list[int], timeout: float = 2.0) -> list[PortResult]:
-    results = []
-    for port in ports:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
+    else:
         state = PortState.FILTERED
-        rtt = 0.0
-        try:
-            start = time.perf_counter()
-            sock.connect((target, port))
-            rtt = (time.perf_counter() - start) * 1000
-            state = PortState.OPEN
-        except socket.timeout:
-            state = PortState.FILTERED
-        except ConnectionRefusedError:
-            state = PortState.CLOSED
-        except OSError:
-            state = PortState.FILTERED
-        finally:
-            sock.close()
-        results.append(PortResult(port=port, state=state, service=_resolve_service(port), rtt_ms=rtt))
+
+    return PortResult(port=port, state=state, service=_resolve_service(port), rtt_ms=elapsed)
+
+
+def _scan_single_connect(target: str, port: int, timeout: float) -> PortResult:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    state = PortState.FILTERED
+    rtt = 0.0
+    try:
+        start = time.perf_counter()
+        sock.connect((target, port))
+        rtt = (time.perf_counter() - start) * 1000
+        state = PortState.OPEN
+    except socket.timeout:
+        state = PortState.FILTERED
+    except ConnectionRefusedError:
+        state = PortState.CLOSED
+    except OSError:
+        state = PortState.FILTERED
+    finally:
+        sock.close()
+    return PortResult(port=port, state=state, service=_resolve_service(port), rtt_ms=rtt)
+
+
+def scan_ports_threaded(target: str, ports: list[int], timeout: float = 2.0,
+                        progress_cb=None) -> list[PortResult]:
+    """
+    Scan ports with threading. Uses SYN when root, connect otherwise.
+    progress_cb is called after each port completes (for progress bar).
+    """
+    use_syn = _is_root() and HAS_SCAPY
+    scan_fn = _scan_single_syn if use_syn else _scan_single_connect
+    results: list[PortResult] = []
+
+    # SYN scan with scapy isn't safe to parallelize heavily since scapy
+    # uses a shared socket; limit threads for SYN, go wide for connect
+    workers = min(10, len(ports)) if use_syn else min(MAX_THREADS, len(ports))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        future_map = {pool.submit(scan_fn, target, p, timeout): p for p in ports}
+        for future in concurrent.futures.as_completed(future_map):
+            r = future.result()
+            results.append(r)
+            if progress_cb:
+                progress_cb(r)
+
+    results.sort(key=lambda r: r.port)
     return results
-
-
-def scan_ports(target: str, ports: list[int] | None = None, deep: bool = False, timeout: float = 2.0) -> list[PortResult]:
-    if not HAS_SCAPY and _is_root():
-        console.print("[red]scapy not installed — falling back to connect scan[/red]")
-
-    if ports is None:
-        ports = list(range(1, 1025)) if deep else TOP_PORTS
-
-    if _is_root() and HAS_SCAPY:
-        return _syn_scan(target, ports, timeout=timeout)
-    return _connect_scan(target, ports, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +419,7 @@ def measure_latency(target: str, count: int = 10, timeout: float = 2.0, interval
         reply = sr1(pkt, timeout=timeout)
         elapsed = (time.perf_counter() - start) * 1000
         stats.sent += 1
-        if reply is not None:
+        if reply is not None and reply.haslayer(ICMP) and reply[ICMP].type == 0:
             stats.received += 1
             stats.rtts.append(elapsed)
         if seq < count - 1 and interval > 0:
@@ -376,7 +432,6 @@ def measure_latency(target: str, count: int = 10, timeout: float = 2.0, interval
 # ---------------------------------------------------------------------------
 
 def _banner() -> None:
-    # gradient steps from bright cyan down to deep blue-violet
     colors = [
         "#00ffff",
         "#00e5ff",
@@ -394,7 +449,7 @@ def _banner() -> None:
         "  \\ \\ \\/\\ \\ \\ \\\\ \\\\ \\ \\/, \\ \\ \\_\\ \\/\\ \\L\\ \\",
         "   \\ \\_\\ \\_\\ \\_\\ \\_\\ \\____/\\ \\_____\\ `\\____\\",
         "    \\/_/\\/_/\\/_/\\/ /\\/___/  \\/_____/\\/_____/",
-        "      made by TucoT9 | https://github.com/t9tuco/project-argus",
+        "      made by TucoT9 | github.com/t9tuco/project-argus",
     ]
     txt = Text()
     for i, line in enumerate(lines):
@@ -414,7 +469,7 @@ def _show_hosts(hosts: list[Host]) -> None:
     tbl.add_column("RTT (ms)", justify="right")
     tbl.add_column("OS Hint", style="italic")
     tbl.add_column("Status", justify="center")
-    for h in sorted(hosts, key=lambda x: x.ip):
+    for h in sorted(hosts, key=lambda x: ipaddress.ip_address(x.ip)):
         rtt = f"{h.avg_rtt:.1f}" if h.rtt_ms else "—"
         mac = h.mac or "—"
         st = "[green]● up[/green]" if h.alive else "[red]● down[/red]"
@@ -430,13 +485,14 @@ def _show_scan(target: str, results: list[PortResult]) -> None:
     tbl.add_column("Port", style="bold white", justify="right", min_width=7)
     tbl.add_column("State", min_width=10)
     tbl.add_column("Service", style="dim")
+    tbl.add_column("Banner", style="dim italic", max_width=40)
     tbl.add_column("RTT (ms)", justify="right")
     for r in results:
         if r.state == PortState.CLOSED:
             continue
         s = "[green]open[/green]" if r.state == PortState.OPEN else "[yellow]filtered[/yellow]"
         rtt = f"{r.rtt_ms:.1f}" if r.rtt_ms > 0 else "—"
-        tbl.add_row(str(r.port), s, r.service or "—", rtt)
+        tbl.add_row(str(r.port), s, r.service or "—", r.banner or "—", rtt)
     console.print(tbl)
     console.print(f"[dim]{open_ct} open, {filt_ct} filtered, {len(results)} scanned[/dim]\n")
 
@@ -457,7 +513,193 @@ def _show_latency(stats: LatencyStats) -> None:
 
 
 # ---------------------------------------------------------------------------
-# commands
+# interactive mode
+# ---------------------------------------------------------------------------
+
+def _interactive() -> None:
+    _banner()
+    priv = "[green]root[/green]" if _is_root() else "[red]unprivileged[/red]"
+    console.print(f"  [dim]running as {priv} | scapy {'[green]ok[/green]' if HAS_SCAPY else '[red]missing[/red]'}[/dim]\n")
+
+    while True:
+        console.print("[bold cyan]What do you want to do?[/bold cyan]\n")
+        console.print("  [bold white]1[/bold white]  Discover hosts on a network")
+        console.print("  [bold white]2[/bold white]  Scan ports on a host")
+        console.print("  [bold white]3[/bold white]  Ping a host (latency stats)")
+        console.print("  [bold white]4[/bold white]  Monitor a network (continuous)")
+        console.print("  [bold white]5[/bold white]  Exit")
+        console.print()
+
+        choice = Prompt.ask("[cyan]>[/cyan]", choices=["1", "2", "3", "4", "5"], default="5")
+
+        if choice == "1":
+            _interactive_discover()
+        elif choice == "2":
+            _interactive_scan()
+        elif choice == "3":
+            _interactive_ping()
+        elif choice == "4":
+            _interactive_monitor()
+        else:
+            console.print("[dim]bye.[/dim]")
+            break
+
+        console.print()
+        if not Confirm.ask("[dim]Run another command?[/dim]", default=True):
+            console.print("[dim]bye.[/dim]")
+            break
+        console.print()
+
+
+def _interactive_discover() -> None:
+    target = Prompt.ask("\n[cyan]Network (CIDR)[/cyan]", default="192.168.1.0/24")
+    target = _resolve_target(target, expect_network=True)
+
+    if not _is_root():
+        console.print("[red]Discovery needs root. Restart with sudo.[/red]")
+        return
+
+    timeout = float(Prompt.ask("[cyan]Timeout (sec)[/cyan]", default="2"))
+    retries = int(Prompt.ask("[cyan]Retries[/cyan]", default="1"))
+
+    with console.status("[bold cyan]Scanning network...[/bold cyan]", spinner="dots"):
+        hosts = discover_hosts(target, timeout=timeout, retries=retries)
+    _show_hosts(hosts)
+
+
+def _interactive_scan() -> None:
+    target = Prompt.ask("\n[cyan]Target (IP, hostname, or URL)[/cyan]")
+    target = _resolve_target(target, expect_network=False)
+
+    console.print("\n[bold cyan]Scan type:[/bold cyan]")
+    console.print("  [white]1[/white]  Common ports (26 ports)")
+    console.print("  [white]2[/white]  Deep scan (1–1024)")
+    console.print("  [white]3[/white]  Custom port list")
+    scan_type = Prompt.ask("[cyan]>[/cyan]", choices=["1", "2", "3"], default="1")
+
+    if scan_type == "3":
+        port_spec = Prompt.ask("[cyan]Ports (e.g. 22,80,100-200,443)[/cyan]")
+        ports = _parse_ports(port_spec)
+    elif scan_type == "2":
+        ports = list(range(1, 1025))
+    else:
+        ports = TOP_PORTS
+
+    timeout = float(Prompt.ask("[cyan]Timeout (sec)[/cyan]", default="2"))
+    grab = Confirm.ask("[cyan]Grab banners on open ports?[/cyan]", default=False)
+
+    method = "SYN" if _is_root() and HAS_SCAPY else "connect"
+    console.print(f"\n[dim]{len(ports)} ports | {method} scan[/dim]\n")
+
+    results: list[PortResult] = []
+    with Progress(
+        SpinnerColumn("dots"), TextColumn("[cyan]Scanning[/cyan]"),
+        BarColumn(bar_width=40), TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(), console=console,
+    ) as prog:
+        task = prog.add_task("scan", total=len(ports))
+
+        def on_result(r: PortResult) -> None:
+            results.append(r)
+            prog.advance(task)
+
+        scan_ports_threaded(target, ports, timeout=timeout, progress_cb=on_result)
+
+    if grab:
+        open_results = [r for r in results if r.state == PortState.OPEN]
+        if open_results:
+            with console.status("[cyan]Grabbing banners...[/cyan]", spinner="dots"):
+                for r in open_results:
+                    r.banner = _grab_banner(target, r.port, timeout=timeout)
+
+    results.sort(key=lambda r: r.port)
+    _show_scan(target, results)
+
+
+def _interactive_ping() -> None:
+    target = Prompt.ask("\n[cyan]Target (IP, hostname, or URL)[/cyan]")
+    target = _resolve_target(target, expect_network=False)
+
+    if not _is_root():
+        console.print("[red]Ping needs root. Restart with sudo.[/red]")
+        return
+
+    count = int(Prompt.ask("[cyan]Ping count[/cyan]", default="10"))
+    timeout = float(Prompt.ask("[cyan]Timeout (sec)[/cyan]", default="2"))
+
+    with Progress(
+        SpinnerColumn("dots"), TextColumn("[cyan]Pinging[/cyan]"),
+        BarColumn(bar_width=30), TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(), console=console,
+    ) as prog:
+        task = prog.add_task(target, total=count)
+        stats = LatencyStats(ip=target)
+
+        for seq in range(count):
+            pkt = IP(dst=target) / ICMP(seq=seq)
+            start = time.perf_counter()
+            reply = sr1(pkt, timeout=timeout)
+            elapsed = (time.perf_counter() - start) * 1000
+            stats.sent += 1
+            ok = reply is not None and reply.haslayer(ICMP) and reply[ICMP].type == 0
+            if ok:
+                stats.received += 1
+                stats.rtts.append(elapsed)
+            prog.advance(task)
+            mark = "[green]ok[/green]" if ok else "[red]timeout[/red]"
+            console.print(f"  seq={seq + 1}  {mark}  rtt={elapsed:.1f}ms")
+            if seq < count - 1:
+                time.sleep(0.5)
+
+    console.print()
+    _show_latency(stats)
+
+
+def _interactive_monitor() -> None:
+    target = Prompt.ask("\n[cyan]Network (CIDR)[/cyan]", default="192.168.1.0/24")
+    target = _resolve_target(target, expect_network=True)
+
+    if not _is_root():
+        console.print("[red]Monitoring needs root. Restart with sudo.[/red]")
+        return
+
+    interval = float(Prompt.ask("[cyan]Interval between sweeps (sec)[/cyan]", default="30"))
+    timeout = float(Prompt.ask("[cyan]Timeout (sec)[/cyan]", default="2"))
+
+    console.print(f"\n[dim]Monitoring [bold]{target}[/bold] every {interval}s — Ctrl+C to stop[/dim]\n")
+    known: dict[str, Host] = {}
+    sweep = 0
+    try:
+        while True:
+            sweep += 1
+            console.rule(f"[cyan]sweep #{sweep}[/cyan]")
+            with console.status("[cyan]Discovering...[/cyan]", spinner="dots"):
+                hosts = discover_hosts(target, timeout=timeout)
+            for h in hosts:
+                known[h.ip] = h
+
+            if known:
+                with console.status("[cyan]Checking latency...[/cyan]", spinner="dots"):
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as pool:
+                        futures = {pool.submit(measure_latency, ip, 3, timeout, 0.2): ip for ip in known}
+                        for f in concurrent.futures.as_completed(futures):
+                            ip = futures[f]
+                            st = f.result()
+                            if st.rtts:
+                                known[ip].rtt_ms = st.rtts
+                                known[ip].alive = True
+                            else:
+                                known[ip].alive = False
+
+            _show_hosts(list(known.values()))
+            console.print(f"[dim]next sweep in {interval}s...[/dim]\n")
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Stopped.[/yellow]")
+
+
+# ---------------------------------------------------------------------------
+# cli commands
 # ---------------------------------------------------------------------------
 
 def cmd_discover(args: argparse.Namespace) -> None:
@@ -476,46 +718,44 @@ def cmd_discover(args: argparse.Namespace) -> None:
 def cmd_scan(args: argparse.Namespace) -> None:
     _banner()
     args.target = _resolve_target(args.target, expect_network=False)
+
     port_list = None
     if args.ports:
-        try:
-            port_list = [int(p.strip()) for p in args.ports.split(",")]
-        except ValueError:
-            console.print("[red]Bad port list. Use comma-separated numbers.[/red]")
-            sys.exit(1)
+        port_list = _parse_ports(args.ports)
 
+    ports = port_list or (list(range(1, 1025)) if args.deep else TOP_PORTS)
     method = "SYN" if _is_root() and HAS_SCAPY else "connect"
-    total = len(port_list) if port_list else (1024 if args.deep else len(TOP_PORTS))
-    console.print(f"[dim]Target: [bold]{args.target}[/bold] | {total} ports | {method} scan[/dim]\n")
+    console.print(f"[dim]Target: [bold]{args.target}[/bold] | {len(ports)} ports | {method} scan[/dim]\n")
 
+    results: list[PortResult] = []
     with Progress(
-        SpinnerColumn("dots"),
-        TextColumn("[cyan]Scanning[/cyan]"),
-        BarColumn(bar_width=40),
-        TextColumn("{task.completed}/{task.total}"),
-        TimeElapsedColumn(),
-        console=console,
+        SpinnerColumn("dots"), TextColumn("[cyan]Scanning[/cyan]"),
+        BarColumn(bar_width=40), TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(), console=console,
     ) as prog:
-        task = prog.add_task("scan", total=total)
+        task = prog.add_task("scan", total=len(ports))
 
-        # wrap the scan to get progress updates
-        if _is_root() and HAS_SCAPY:
-            results = []
-            ports = port_list or (list(range(1, 1025)) if args.deep else TOP_PORTS)
-            for port in ports:
-                r = _syn_scan(args.target, [port], timeout=args.timeout)
-                results.extend(r)
-                prog.advance(task)
-        else:
-            results = []
-            ports = port_list or (list(range(1, 1025)) if args.deep else TOP_PORTS)
-            for port in ports:
-                r = _connect_scan(args.target, [port], timeout=args.timeout)
-                results.extend(r)
-                prog.advance(task)
+        def on_result(r: PortResult) -> None:
+            results.append(r)
+            prog.advance(task)
 
+        scan_ports_threaded(args.target, ports, timeout=args.timeout, progress_cb=on_result)
+
+    # banner grab on open ports
+    if args.banner:
+        open_results = [r for r in results if r.state == PortState.OPEN]
+        if open_results:
+            with console.status("[cyan]Grabbing banners...[/cyan]", spinner="dots"):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as pool:
+                    futures = {pool.submit(_grab_banner, args.target, r.port, args.timeout): r for r in open_results}
+                    for f in concurrent.futures.as_completed(futures):
+                        r = futures[f]
+                        r.banner = f.result()
+
+    results.sort(key=lambda r: r.port)
     if args.json:
-        data = [{"port": r.port, "state": r.state.value, "service": r.service, "rtt_ms": round(r.rtt_ms, 2)} for r in results]
+        data = [{"port": r.port, "state": r.state.value, "service": r.service,
+                 "banner": r.banner, "rtt_ms": round(r.rtt_ms, 2)} for r in results]
         console.print_json(json_mod.dumps(data))
     else:
         _show_scan(args.target, results)
@@ -527,12 +767,9 @@ def cmd_ping(args: argparse.Namespace) -> None:
     _banner()
 
     with Progress(
-        SpinnerColumn("dots"),
-        TextColumn("[cyan]Pinging {task.description}[/cyan]"),
-        BarColumn(bar_width=30),
-        TextColumn("{task.completed}/{task.total}"),
-        TimeElapsedColumn(),
-        console=console,
+        SpinnerColumn("dots"), TextColumn("[cyan]Pinging {task.description}[/cyan]"),
+        BarColumn(bar_width=30), TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(), console=console,
     ) as prog:
         task = prog.add_task(args.target, total=args.count)
         stats = LatencyStats(ip=args.target)
@@ -543,7 +780,7 @@ def cmd_ping(args: argparse.Namespace) -> None:
             reply = sr1(pkt, timeout=args.timeout)
             elapsed = (time.perf_counter() - start) * 1000
             stats.sent += 1
-            ok = reply is not None
+            ok = reply is not None and reply.haslayer(ICMP) and reply[ICMP].type == 0
             if ok:
                 stats.received += 1
                 stats.rtts.append(elapsed)
@@ -581,15 +818,18 @@ def cmd_monitor(args: argparse.Namespace) -> None:
             for h in hosts:
                 known[h.ip] = h
 
-            # quick latency check
             if known:
-                for ip in list(known):
-                    st = measure_latency(ip, count=3, timeout=args.timeout, interval=0.2)
-                    if st.rtts:
-                        known[ip].rtt_ms = st.rtts
-                        known[ip].alive = True
-                    else:
-                        known[ip].alive = False
+                with console.status("[cyan]Checking latency...[/cyan]", spinner="dots"):
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as pool:
+                        futures = {pool.submit(measure_latency, ip, 3, args.timeout, 0.2): ip for ip in known}
+                        for f in concurrent.futures.as_completed(futures):
+                            ip = futures[f]
+                            st = f.result()
+                            if st.rtts:
+                                known[ip].rtt_ms = st.rtts
+                                known[ip].alive = True
+                            else:
+                                known[ip].alive = False
 
             _show_hosts(list(known.values()))
             console.print(f"[dim]next sweep in {args.interval}s...[/dim]\n")
@@ -603,33 +843,30 @@ def cmd_monitor(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="argus", description="Network scanner and monitor.")
-    p.add_argument("--version", action="version", version="argus 0.1.0")
+    p = argparse.ArgumentParser(prog="argus", description="Network scanner and monitor. Run without arguments for interactive mode.")
+    p.add_argument("--version", action="version", version="argus 0.2.0")
     sub = p.add_subparsers(dest="command")
 
-    # discover
     d = sub.add_parser("discover", help="ARP/ICMP host discovery")
     d.add_argument("target", help="Network in CIDR notation (e.g. 192.168.1.0/24)")
     d.add_argument("-t", "--timeout", type=float, default=2.0)
     d.add_argument("-r", "--retries", type=int, default=1)
     d.add_argument("--json", action="store_true")
 
-    # scan
     s = sub.add_parser("scan", help="TCP port scan")
-    s.add_argument("target", help="Target IP address")
-    s.add_argument("-p", "--ports", help="Comma-separated ports")
+    s.add_argument("target", help="Target IP, hostname, or URL")
+    s.add_argument("-p", "--ports", help="Ports: 22,80,100-200,443")
     s.add_argument("--deep", action="store_true", help="Scan 1-1024")
     s.add_argument("-t", "--timeout", type=float, default=2.0)
+    s.add_argument("-b", "--banner", action="store_true", help="Grab banners on open ports")
     s.add_argument("--json", action="store_true")
 
-    # ping
     pg = sub.add_parser("ping", help="ICMP ping with latency stats")
-    pg.add_argument("target", help="Target IP address")
+    pg.add_argument("target", help="Target IP, hostname, or URL")
     pg.add_argument("-c", "--count", type=int, default=10)
     pg.add_argument("-t", "--timeout", type=float, default=2.0)
     pg.add_argument("--json", action="store_true")
 
-    # monitor
     m = sub.add_parser("monitor", help="Continuous network monitoring")
     m.add_argument("target", help="Network in CIDR notation")
     m.add_argument("-i", "--interval", type=float, default=30.0)
@@ -642,9 +879,10 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
+    # no subcommand → interactive mode
     if args.command is None:
-        parser.print_help()
-        sys.exit(0)
+        _interactive()
+        return
 
     dispatch = {
         "discover": cmd_discover,
