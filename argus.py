@@ -330,20 +330,31 @@ def measure_latency(target: str, count: int = 10, timeout: float = 2.0, interval
 # ---------------------------------------------------------------------------
 
 def _banner() -> None:
-    txt = Text.from_markup(
-        "[bold cyan]    ___ "
-        "  ___  ___  _   _  ___\n"
-        "   /   |"
-        " | _ \\/ __|| | | |/ __|\n"
-        "  / /| |"
-        " |   /\\__ \\| |_| |\\__ \\\n"
-        " / ___ |"
-        " |_|_\\|___/ \\___/ |___/\n"
-        "/_/  |_|"
-        "[/bold cyan]\n"
-        "[dim]network scanner & monitor[/dim]"
-    )
-    console.print(Panel(txt, border_style="cyan", padding=(0, 2)))
+    # gradient steps from bright cyan down to deep blue-violet
+    colors = [
+        "#00ffff",
+        "#00e5ff",
+        "#00c8ff",
+        "#00aaff",
+        "#008cff",
+        "#006fff",
+        "#5555ff",
+    ]
+    lines = [
+        r" ______  ____    ____    __  __  ____       ",
+        r"/\  _  \/\  _`\ /\  _`\ /\ \/\ \/\  _`\    ",
+        r"\ \ \L\ \ \ \L\ \ \ \L\_\ \ \ \ \ \,\L\_\  ",
+        r" \ \  __ \ \ ,  /\ \ \L_L\ \ \ \ \/_\__ \  ",
+        r"  \ \ \/\ \ \ \\ \\ \ \/, \ \ \_\ \/\ \L\ \",
+        r"   \ \_\ \_\ \_\ \_\ \____/\ \_____\ `\____\\",
+        r"    \/_/\/_/\/_/\/ /\/___/  \/_____/\/_____/",
+    ]
+    txt = Text()
+    for i, line in enumerate(lines):
+        color = colors[min(i, len(colors) - 1)]
+        txt.append(line + "\n", style=f"bold {color}")
+    txt.append("\n  network scanner & monitor", style="dim")
+    console.print(Panel(txt, border_style="#00aaff", padding=(0, 2)))
 
 
 def _show_hosts(hosts: list[Host]) -> None:
