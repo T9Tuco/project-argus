@@ -1,2 +1,3 @@
 scapy>=2.5.0
 rich>=13.0.0
+PySocks>=1.7.1  # optional, only needed for --tor mode

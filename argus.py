@@ -7,12 +7,15 @@ import ipaddress
 import json as json_mod
 import os
 import platform
+import random
 import socket
 import sys
 import time
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from enum import Enum
+from threading import local as thread_local
 from typing import Optional
 
 # scapy is optional, falls back to connect scan if missing
@@ -35,7 +38,98 @@ except ImportError:
     print("missing dependency: pip install rich")
     sys.exit(1)
 
+# PySocks is optional, only needed for --tor mode
+try:
+    import socks as _socks_mod
+    HAS_SOCKS = True
+except ImportError:
+    HAS_SOCKS = False
+
 MAX_THREADS = 50
+ARGUS_VERSION = "0.2.0"
+
+
+def _check_version() -> Optional[str]:
+    # fetch latest release tag from GitHub, return it if newer than ARGUS_VERSION
+    try:
+        url = "https://api.github.com/repos/T9Tuco/project-argus/releases/latest"
+        req = urllib.request.Request(url, headers={"User-Agent": "argus-version-check"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json_mod.loads(resp.read().decode())
+        tag = data.get("tag_name", "").lstrip("v")
+        if not tag:
+            return None
+        # compare as tuples so "0.3.0" > "0.2.0"
+        def _ver(s: str):
+            try:
+                return tuple(int(x) for x in s.split("."))
+            except ValueError:
+                return (0,)
+        if _ver(tag) > _ver(ARGUS_VERSION):
+            return tag
+    except Exception:
+        pass
+    return None
+
+
+_real_socket = socket.socket
+
+
+def _tor_identity() -> str:
+    if not hasattr(_tor_thread_data, "identity"):
+        _tor_thread_data.identity = str(random.randint(1, 999_999_999))
+    return _tor_thread_data.identity
+
+
+def _tor_rotate() -> None:
+    _tor_thread_data.identity = str(random.randint(1, 999_999_999))
+
+
+def _tor_check(port: int) -> bool:
+    # always use the real socket here, even if patching is already active
+    try:
+        s = _real_socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(("127.0.0.1", port))
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def _tor_find_port() -> Optional[int]:
+    for port in (9050, 9150):
+        if _tor_check(port):
+            return port
+    return None
+
+
+def _tor_patch_socket(tor_port: int) -> None:
+    if not HAS_SOCKS:
+        console.print("[red]PySocks not installed — pip install PySocks[/red]")
+        sys.exit(1)
+
+    current_port = tor_port
+
+    class _TorSocket(_socks_mod.socksocket):
+        def __init__(self, family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0, _sock=None):
+            super().__init__(family, type, proto, _sock)
+            ident = _tor_identity()
+            self.set_proxy(
+                _socks_mod.SOCKS5,
+                "127.0.0.1",
+                current_port,
+                True,
+                username=ident,
+                password=ident,
+            )
+
+    socket.socket = _TorSocket
+
+
+def _tor_unpatch_socket() -> None:
+    socket.socket = _real_socket
+
 
 
 def _is_root() -> bool:
@@ -324,6 +418,7 @@ def _scan_single_syn(target: str, port: int, timeout: float) -> PortResult:
 
 def _scan_single_connect(target: str, port: int, timeout: float) -> PortResult:
     # unprivileged fallback using a full TCP connect
+    # if socket is patched via _tor_patch_socket(), this transparently goes through Tor
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     state = PortState.FILTERED
@@ -345,9 +440,10 @@ def _scan_single_connect(target: str, port: int, timeout: float) -> PortResult:
 
 
 def scan_ports_threaded(target: str, ports: list[int], timeout: float = 2.0,
-                        progress_cb=None) -> list[PortResult]:
+                        progress_cb=None, force_connect: bool = False) -> list[PortResult]:
     # SYN scan needs root and scapy, otherwise falls back to connect scan
-    use_syn = _is_root() and HAS_SCAPY
+    # force_connect=True is used when routing through Tor (raw sockets don't go through SOCKS)
+    use_syn = _is_root() and HAS_SCAPY and not force_connect
     scan_fn = _scan_single_syn if use_syn else _scan_single_connect
     results: list[PortResult] = []
 
@@ -410,8 +506,13 @@ def _banner() -> None:
     for i, line in enumerate(lines):
         color = colors[min(i, len(colors) - 1)]
         txt.append(line + "\n", style=f"bold {color}")
-    txt.append("\n  network scanner & monitor", style="dim")
+    txt.append(f"\n  network scanner & monitor  v{ARGUS_VERSION}", style="dim")
     console.print(Panel(txt, border_style="#00aaff", padding=(0, 2)))
+
+    # non-blocking version check — if it fails (offline, etc.) just skip it
+    new_ver = _check_version()
+    if new_ver:
+        console.print(f"  [yellow]update available: v{new_ver} — github.com/T9Tuco/project-argus[/yellow]\n")
 
 
 def _show_hosts(hosts: list[Host]) -> None:
@@ -470,26 +571,30 @@ def _show_latency(stats: LatencyStats) -> None:
 def _interactive() -> None:
     _banner()
     priv = "[green]root[/green]" if _is_root() else "[red]unprivileged[/red]"
-    console.print(f"  [dim]running as {priv} | scapy {'[green]ok[/green]' if HAS_SCAPY else '[red]missing[/red]'}[/dim]\n")
+    tor_status = "[green]ok[/green]" if HAS_SOCKS else "[red]missing (pip install PySocks)[/red]"
+    console.print(f"  [dim]running as {priv} | scapy {'[green]ok[/green]' if HAS_SCAPY else '[red]missing[/red]'} | tor {tor_status}[/dim]\n")
 
     while True:
         console.print("[bold cyan]What do you want to do?[/bold cyan]\n")
         console.print("  [bold white]1[/bold white]  Discover hosts on a network")
         console.print("  [bold white]2[/bold white]  Scan ports on a host")
-        console.print("  [bold white]3[/bold white]  Ping a host (latency stats)")
-        console.print("  [bold white]4[/bold white]  Monitor a network (continuous)")
-        console.print("  [bold white]5[/bold white]  Exit")
+        console.print("  [bold white]3[/bold white]  Scan ports via Tor (anonymous)")
+        console.print("  [bold white]4[/bold white]  Ping a host (latency stats)")
+        console.print("  [bold white]5[/bold white]  Monitor a network (continuous)")
+        console.print("  [bold white]6[/bold white]  Exit")
         console.print()
 
-        choice = Prompt.ask("[cyan]>[/cyan]", choices=["1", "2", "3", "4", "5"], default="5")
+        choice = Prompt.ask("[cyan]>[/cyan]", choices=["1", "2", "3", "4", "5", "6"], default="6")
 
         if choice == "1":
             _interactive_discover()
         elif choice == "2":
-            _interactive_scan()
+            _interactive_scan(use_tor=False)
         elif choice == "3":
-            _interactive_ping()
+            _interactive_scan(use_tor=True)
         elif choice == "4":
+            _interactive_ping()
+        elif choice == "5":
             _interactive_monitor()
         else:
             console.print("[dim]bye.[/dim]")
@@ -518,7 +623,7 @@ def _interactive_discover() -> None:
     _show_hosts(hosts)
 
 
-def _interactive_scan() -> None:
+def _interactive_scan(use_tor: bool = False) -> None:
     target = Prompt.ask("\n[cyan]Target (IP, hostname, or URL)[/cyan]")
     target = _resolve_target(target, expect_network=False)
 
@@ -539,7 +644,25 @@ def _interactive_scan() -> None:
     timeout = float(Prompt.ask("[cyan]Timeout (sec)[/cyan]", default="2"))
     grab = Confirm.ask("[cyan]Grab banners on open ports?[/cyan]", default=False)
 
-    method = "SYN" if _is_root() and HAS_SCAPY else "connect"
+    # only ask if caller didn't already decide
+    if not use_tor:
+        use_tor = Confirm.ask("[cyan]Route through Tor?[/cyan]", default=False)
+
+    if use_tor:
+        if not HAS_SOCKS:
+            console.print("[red]Tor mode requires PySocks: pip install PySocks[/red]")
+            return
+        tor_port = _tor_find_port()
+        if tor_port is None:
+            console.print("[red]Tor not detected on ports 9050 or 9150. Start Tor first.[/red]")
+            if platform.system() != "Windows":
+                console.print("[dim]Linux: sudo systemctl start tor[/dim]")
+                console.print("[dim]Also add 'SocksPolicy accept 127.0.0.1' to /etc/tor/torrc if circuit isolation fails.[/dim]")
+            return
+        _tor_patch_socket(tor_port)
+        console.print(f"[dim]Tor active on port {tor_port} | circuit isolation per thread[/dim]")
+
+    method = "connect (via Tor)" if use_tor else ("SYN" if _is_root() and HAS_SCAPY else "connect")
     console.print(f"\n[dim]{len(ports)} ports | {method} scan[/dim]\n")
 
     results: list[PortResult] = []
@@ -554,7 +677,8 @@ def _interactive_scan() -> None:
             results.append(r)
             prog.advance(task)
 
-        scan_ports_threaded(target, ports, timeout=timeout, progress_cb=on_result)
+        scan_ports_threaded(target, ports, timeout=timeout, progress_cb=on_result,
+                            force_connect=use_tor)
 
     if grab:
         open_results = [r for r in results if r.state == PortState.OPEN]
@@ -666,12 +790,28 @@ def cmd_scan(args: argparse.Namespace) -> None:
     _banner()
     args.target = _resolve_target(args.target, expect_network=False)
 
+    if args.tor:
+        if not HAS_SOCKS:
+            console.print("[red]--tor requires PySocks: pip install PySocks[/red]")
+            sys.exit(1)
+        tor_port = _tor_find_port()
+        if tor_port is None:
+            console.print("[red]Tor not detected on ports 9050 or 9150. Start Tor first.[/red]")
+            if platform.system() != "Windows":
+                console.print("[dim]Linux: sudo systemctl start tor[/dim]")
+                console.print("[dim]Also add 'SocksPolicy accept 127.0.0.1' to /etc/tor/torrc if circuit isolation fails.[/dim]")
+            sys.exit(1)
+        _tor_patch_socket(tor_port)
+        console.print(f"[dim]Tor active on port {tor_port} | circuit isolation per thread[/dim]")
+
     port_list = None
     if args.ports:
         port_list = _parse_ports(args.ports)
 
     ports = port_list or (list(range(1, 1025)) if args.deep else TOP_PORTS)
-    method = "SYN" if _is_root() and HAS_SCAPY else "connect"
+    method = "SYN" if _is_root() and HAS_SCAPY and not args.tor else "connect"
+    if args.tor:
+        method = "connect (via Tor)"
     console.print(f"[dim]Target: [bold]{args.target}[/bold] | {len(ports)} ports | {method} scan[/dim]\n")
 
     results: list[PortResult] = []
@@ -686,7 +826,8 @@ def cmd_scan(args: argparse.Namespace) -> None:
             results.append(r)
             prog.advance(task)
 
-        scan_ports_threaded(args.target, ports, timeout=args.timeout, progress_cb=on_result)
+        scan_ports_threaded(args.target, ports, timeout=args.timeout, progress_cb=on_result,
+                            force_connect=args.tor)
 
     if args.banner:
         open_results = [r for r in results if r.state == PortState.OPEN]
@@ -789,7 +930,7 @@ def cmd_monitor(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="argus", description="Network scanner and monitor. Run without arguments for interactive mode.")
-    p.add_argument("--version", action="version", version="argus 0.2.0")
+    p.add_argument("--version", action="version", version=f"argus {ARGUS_VERSION}")
     sub = p.add_subparsers(dest="command")
 
     d = sub.add_parser("discover", help="ARP/ICMP host discovery")
@@ -798,12 +939,33 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("-r", "--retries", type=int, default=1)
     d.add_argument("--json", action="store_true")
 
-    s = sub.add_parser("scan", help="TCP port scan")
+    scan_epilog = (
+        "Tor mode routes the scan anonymously through the Tor network.\n"
+        "Requirements: pip install PySocks  +  Tor running (port 9050 or 9150)\n"
+        "\n"
+        "  Linux:   sudo apt install tor && sudo systemctl start tor\n"
+        "  Windows: install Tor Browser or Expert Bundle, launch it first\n"
+        "\n"
+        "Examples:\n"
+        "  argus scan 1.2.3.4 --tor\n"
+        "  argus scan github.com --tor --deep\n"
+        "  argus scan 10.0.0.1 --tor -p 22,80,443 -b\n"
+        "\n"
+        "Note: --tor forces TCP connect scan (SYN scan bypasses SOCKS proxies).\n"
+        "      Each scan thread gets its own Tor circuit for stream isolation."
+    )
+    s = sub.add_parser(
+        "scan",
+        help="TCP port scan",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=scan_epilog,
+    )
     s.add_argument("target", help="Target IP, hostname, or URL")
     s.add_argument("-p", "--ports", help="Ports: 22,80,100-200,443")
-    s.add_argument("--deep", action="store_true", help="Scan 1-1024")
-    s.add_argument("-t", "--timeout", type=float, default=2.0)
+    s.add_argument("--deep", action="store_true", help="Scan ports 1-1024 instead of common ports")
+    s.add_argument("-t", "--timeout", type=float, default=2.0, help="Per-port timeout in seconds (default: 2.0)")
     s.add_argument("-b", "--banner", action="store_true", help="Grab banners on open ports")
+    s.add_argument("--tor", action="store_true", help="Route scan through Tor (requires PySocks + Tor running on 9050/9150)")
     s.add_argument("--json", action="store_true")
 
     pg = sub.add_parser("ping", help="ICMP ping with latency stats")
