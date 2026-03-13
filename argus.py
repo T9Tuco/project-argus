@@ -559,8 +559,8 @@ def _interactive_ping() -> None:
     target = Prompt.ask("\n[cyan]Target (IP, hostname, or URL)[/cyan]")
     target = _resolve_target(target, expect_network=False)
 
-    if not _is_root():
-        console.print("[red]Ping needs root. Restart with sudo.[/red]")
+    if not _is_root() or not HAS_SCAPY:
+        console.print("[red]Ping needs root and scapy. Restart with sudo.[/red]")
         return
 
     count = int(Prompt.ask("[cyan]Ping count[/cyan]", default="10"))
@@ -698,6 +698,9 @@ def cmd_scan(args: argparse.Namespace) -> None:
 def cmd_ping(args: argparse.Namespace) -> None:
     args.target = _resolve_target(args.target, expect_network=False)
     _bail_no_privs("ICMP ping")
+    if not HAS_SCAPY:
+        console.print("[red]scapy not installed — pip install scapy[/red]")
+        sys.exit(1)
     _banner()
 
     with Progress(
