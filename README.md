@@ -1,10 +1,10 @@
 # project argus
 
-this is early. the tool works, but there's a lot more planned — better os fingerprinting, service version detection, traceroute, export formats, a tui dashboard, and more. treat this as v0.1 of something that's going to keep growing.
+this is early. there's a lot more planned — proper os fingerprinting, udp scanning, traceroute, export formats, a tui dashboard, scheduled monitoring with alerting, ipv6. treat this as v0.2 of something that's going to keep growing for a while.
 
 ---
 
-a python-based network scanner and monitor that runs directly as a script. no packaging, no install step — just clone, install two deps, and run. uses scapy for raw packet operations and rich for terminal output.
+a python-based network scanner and monitor. no packaging, no install step — clone, install two deps, done. uses scapy for raw packet operations and rich for terminal output. everything is threaded so scans on real-sized subnets are actually fast.
 
 ## dependencies
 
@@ -12,19 +12,36 @@ a python-based network scanner and monitor that runs directly as a script. no pa
 pip install scapy rich
 ```
 
-- **scapy** — raw socket operations (arp, icmp, tcp syn). required for discovery, ping, and syn scanning
-- **rich** — terminal tables, progress bars, colored output
+most features need root/admin for raw socket access. the tool checks this upfront and tells you what to run.
 
-most features need root/admin privileges for raw socket access. the tool checks this before doing anything and tells you exactly what to run.
+## install as system command
 
-## quickstart
-
-```
+```bash
 git clone https://github.com/T9Tuco/project-argus.git
 cd project-argus
 pip install scapy rich
-sudo python3 argus.py discover 192.168.1.0/24
+sudo ln -sf "$PWD/argus.py" /usr/local/bin/argus.py
+sudo ln -sf "$PWD/argus" /usr/local/bin/argus
+sudo chmod +x /usr/local/bin/argus
 ```
+
+after that, `argus` works from anywhere. or just use the included script:
+
+```bash
+bash install.sh
+```
+
+---
+
+## interactive mode
+
+run `argus` with no arguments to get a menu-driven interface — no need to remember commands:
+
+```
+argus
+```
+
+you'll get a numbered menu to pick what you want to do, then it asks for the target, options, etc. step by step. good for quick one-off scans without looking up flags.
 
 ---
 
@@ -32,97 +49,78 @@ sudo python3 argus.py discover 192.168.1.0/24
 
 ### discover
 
-arp/icmp sweep to find live hosts on a subnet.
+arp/icmp sweep to find live hosts on a subnet. parallel on large ranges.
 
 ```
-sudo python3 argus.py discover <network>
+sudo argus discover 192.168.1.0/24
+sudo argus discover 10.0.0.0/8 --timeout 3 --retries 2
+sudo argus discover 192.168.0.0/24 --json
 ```
 
-```
-sudo python3 argus.py discover 192.168.1.0/24
-sudo python3 argus.py discover 10.0.0.0/8 --timeout 3 --retries 2
-sudo python3 argus.py discover 192.168.0.0/24 --json
-```
+uses arp for local (rfc1918) subnets — fast and doesn't depend on icmp being unfiltered. falls back to threaded icmp ping sweep for remote subnets or if arp returns nothing.
 
-on local subnets (rfc1918) it sends arp who-has broadcasts — fast and reliable, doesn't depend on icmp being unfiltered. for anything else it falls back to icmp echo. if arp returns nothing, it also tries icmp as a fallback.
-
-output shows: ip, mac address, avg rtt, os hint (from ttl), and status.
+output: ip, mac, avg rtt, os hint (ttl-based), status.
 
 ---
 
 ### scan
 
-tcp port scan on a single host or ip. accepts ips, hostnames, and full urls — it strips the url and resolves dns automatically.
+tcp port scan. accepts ips, hostnames, and full urls.
 
 ```
-sudo python3 argus.py scan <target>
+sudo argus scan 192.168.1.1
+sudo argus scan 192.168.1.1 --deep
+sudo argus scan 192.168.1.1 -p 22,80,100-200,443
+sudo argus scan github.com -b
+sudo argus scan https://example.com --json
 ```
 
-```
-sudo python3 argus.py scan 192.168.1.1
-sudo python3 argus.py scan 192.168.1.1 --deep
-sudo python3 argus.py scan 192.168.1.1 -p 22,80,443,8080
-sudo python3 argus.py scan github.com
-sudo python3 argus.py scan https://example.com --json
-```
+**port specs:**
+- `-p 22,80,443` — specific ports
+- `-p 100-200` — range
+- `-p 22,80,100-200,443` — mix
+- `--deep` — all ports 1–1024
+
+**`-b` / `--banner`** — after finding open ports, connects and reads the first 80 chars of the service response. works for ssh, http, ftp, smtp etc.
 
 **scan modes:**
-- default: scans 26 common ports (see list below)
-- `--deep`: scans all ports 1–1024
-- `-p / --ports`: comma-separated list of specific ports
+- with root + scapy: tcp syn (half-open). fast, low-noise.
+- without root: tcp connect(). slower, but no privileges needed.
 
-**how it works:**
-- with root + scapy: tcp syn scan (half-open). sends a syn packet, classifies the response:
-  - syn-ack → open, then sends rst to tear down the connection
-  - rst → closed
-  - no response → filtered
-- without root: falls back to full tcp connect(). slower and noisier but doesn't need privileges
+both modes are threaded. syn scan uses up to 10 parallel workers (scapy shared-socket limitation), connect scan up to 50.
 
-**default port list:**
-`21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993, 995, 1723, 3306, 3389, 5432, 5900, 6379, 8000, 8080, 8443, 8888, 27017`
-
-output shows: port, state (open/filtered), service name, and rtt per port.
+output: port, state (open/filtered), service name, banner, rtt.
 
 ---
 
 ### ping
 
-icmp echo with per-packet results and a stats summary at the end.
+icmp echo with per-packet output and a stats summary.
 
 ```
-sudo python3 argus.py ping <target>
+sudo argus ping 8.8.8.8
+sudo argus ping 8.8.8.8 -c 20
+sudo argus ping google.com --timeout 1
+sudo argus ping 1.1.1.1 --json
 ```
 
-```
-sudo python3 argus.py ping 8.8.8.8
-sudo python3 argus.py ping 8.8.8.8 -c 20
-sudo python3 argus.py ping google.com --timeout 1 --json
-```
+only counts icmp echo reply (type 0) as success — "port unreachable" and other icmp error responses are correctly counted as failures.
 
-sends `count` icmp echo requests with a 500ms interval between them. collects per-packet rtt and builds stats. output includes:
-
-- packets sent / received
-- packet loss %
-- min / avg / max rtt
-- jitter (mean deviation between consecutive rtts)
+output: per-packet seq/status/rtt, then min/avg/max rtt, jitter, packet loss.
 
 ---
 
 ### monitor
 
-continuous network monitoring — runs discover + latency checks in a loop until ctrl+c.
+continuous network monitoring. runs discover + latency checks in a loop.
 
 ```
-sudo python3 argus.py monitor <network>
+sudo argus monitor 192.168.1.0/24
+sudo argus monitor 192.168.1.0/24 --interval 60
+sudo argus monitor 10.0.0.0/24 -i 10 --timeout 1
 ```
 
-```
-sudo python3 argus.py monitor 192.168.1.0/24
-sudo python3 argus.py monitor 192.168.1.0/24 --interval 60
-sudo python3 argus.py monitor 10.0.0.0/24 -i 10 --timeout 1
-```
-
-each sweep: discovers all live hosts, then sends 3 pings to each known host to update rtt and alive status. hosts that stop responding are marked as down but stay in the table so you can see the change.
+each sweep: finds all live hosts, then pings each known host in parallel to update rtt and alive status. hosts that go down stay in the table marked as down so you can see the change.
 
 ---
 
@@ -131,12 +129,13 @@ each sweep: discovers all live hosts, then sends 3 pings to each known host to u
 | flag | commands | default | description |
 |---|---|---|---|
 | `-t` / `--timeout` | all | `2.0` | per-probe timeout in seconds |
-| `-r` / `--retries` | discover | `1` | retries per probe before giving up |
-| `--deep` | scan | off | scan ports 1–1024 instead of common ports |
-| `-p` / `--ports` | scan | — | comma-separated port list, e.g. `22,80,443` |
-| `-c` / `--count` | ping | `10` | number of icmp echo requests to send |
+| `-r` / `--retries` | discover | `1` | retries per probe |
+| `--deep` | scan | off | scan ports 1–1024 |
+| `-p` / `--ports` | scan | — | port spec: `22,80,100-200,443` |
+| `-b` / `--banner` | scan | off | grab service banners on open ports |
+| `-c` / `--count` | ping | `10` | number of icmp echo requests |
 | `-i` / `--interval` | monitor | `30.0` | seconds between sweeps |
-| `--json` | discover, scan, ping | off | output results as json instead of tables |
+| `--json` | discover, scan, ping | off | json output |
 | `--version` | — | — | print version and exit |
 
 ---
@@ -145,45 +144,41 @@ each sweep: discovers all live hosts, then sends 3 pings to each known host to u
 
 | command | needs root | why |
 |---|---|---|
-| `discover` | yes | arp and icmp require raw sockets |
+| `discover` | yes | arp and icmp need raw sockets |
 | `scan` (syn) | yes | raw tcp packet crafting |
-| `scan` (connect) | no | fallback mode, uses normal tcp connect() |
+| `scan` (connect) | no | uses normal tcp connect() |
 | `ping` | yes | raw icmp sockets |
 | `monitor` | yes | uses discover + ping internally |
-
-if you run a command that needs root without it, argus exits immediately with a clear message and the correct `sudo` command to use.
 
 ---
 
 ## target input
 
-all commands accept ips, hostnames, and urls. argus normalises the input before doing anything:
+all commands accept ips, hostnames, and urls:
 
 ```
-sudo python3 argus.py scan https://github.com     # strips to github.com, resolves to ip
-sudo python3 argus.py ping google.com              # dns resolved automatically
-sudo python3 argus.py scan 10.0.0.1               # used as-is
+argus scan https://github.com       # strips to github.com, resolves dns
+argus ping google.com               # dns resolved automatically
+argus scan 10.0.0.1                 # used as-is
 ```
 
-for `discover` and `monitor`, the target must be a cidr range. hostnames and urls are rejected with a clear error and an example.
+`discover` and `monitor` require cidr notation — hostnames are rejected with a clear message.
 
 ---
 
 ## json output
 
-every command except `monitor` supports `--json`. useful for piping into jq or other tools.
-
 ```bash
-sudo python3 argus.py discover 192.168.1.0/24 --json | jq '.[] | select(.alive == true)'
-sudo python3 argus.py scan 10.0.0.1 --deep --json | jq '.[] | select(.state == "open")'
-sudo python3 argus.py ping 8.8.8.8 --json | jq '.avg_ms'
+sudo argus discover 192.168.1.0/24 --json | jq '.[] | select(.alive == true)'
+sudo argus scan 10.0.0.1 --deep --json | jq '.[] | select(.state == "open")'
+sudo argus ping 8.8.8.8 --json | jq '.avg_ms'
 ```
 
 ---
 
 ## os fingerprinting
 
-argus makes a rough os guess based on the ip ttl value in icmp replies:
+rough guess based on ip ttl from icmp replies:
 
 | ttl range | guess |
 |---|---|
@@ -191,23 +186,21 @@ argus makes a rough os guess based on the ip ttl value in icmp replies:
 | 65–128 | windows |
 | 129+ | network device |
 
-this is intentionally rough. proper os fingerprinting (tcp window size, options, etc.) is on the roadmap.
+proper fingerprinting (tcp window size, options analysis) is on the roadmap.
 
 ---
 
 ## what's coming
 
-this is an early version. planned additions, in no particular order:
-
-- service version detection (banner grabbing)
 - udp scanning
 - traceroute with per-hop latency
-- os fingerprinting using tcp stack analysis (not just ttl)
+- real os fingerprinting via tcp stack analysis
+- service version detection improvements
 - exportable reports (json, csv, html)
-- a full tui dashboard using textual
+- tui dashboard (textual)
 - scheduled monitoring with alerting
 - ipv6 support
-- config file support
+- config file (~/.argusrc)
 
 ---
 
