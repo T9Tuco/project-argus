@@ -342,11 +342,11 @@ def _scan_single_syn(target: str, port: int, timeout: float) -> PortResult:
     if reply is None:
         state = PortState.FILTERED
     elif reply.haslayer(TCP):
-        flags = reply[TCP].flags
-        if flags & 0x12:  # SYN-ACK
+        flags = int(reply[TCP].flags)
+        if (flags & 0x02) and not (flags & 0x04):  # SYN bit set, RST not set -> SYN-ACK
             state = PortState.OPEN
             sr1(IP(dst=target) / TCP(dport=port, flags="R"), timeout=0.5)
-        elif flags & 0x04:  # RST
+        elif flags & 0x04:  # RST or RST-ACK -> closed
             state = PortState.CLOSED
         else:
             state = PortState.FILTERED
