@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+# scapy is optional, falls back to connect scan if missing
 try:
     from scapy.all import ARP, Ether, IP, ICMP, TCP, sr1, srp, conf
     conf.verb = 0
@@ -60,6 +61,7 @@ def _bail_no_privs(action: str) -> None:
 
 
 def _resolve_target(raw: str, expect_network: bool = False) -> str:
+    # strip scheme if someone pastes a full URL
     if "://" in raw:
         parsed = urllib.parse.urlparse(raw)
         raw = parsed.hostname or raw
@@ -82,16 +84,18 @@ def _resolve_target(raw: str, expect_network: bool = False) -> str:
     except ValueError:
         pass
 
+    # not an IP, try DNS
     try:
         resolved = socket.gethostbyname(raw)
-        console.print(f"[dim]{raw} → {resolved}[/dim]")
+        console.print(f"[dim]{raw} -> {resolved}[/dim]")
         return resolved
     except socket.gaierror:
-        console.print(f"[bold red]Invalid target:[/bold red] [white]{raw!r}[/white] — not an IP and DNS lookup failed.")
+        console.print(f"[bold red]Invalid target:[/bold red] [white]{raw!r}[/white] not an IP and DNS lookup failed.")
         sys.exit(1)
 
 
 def _is_local(target: str) -> bool:
+    # only sweep with ARP on private networks, not across the internet
     try:
         net = ipaddress.ip_network(target, strict=False)
         return net.is_private and not net.is_loopback
@@ -103,6 +107,7 @@ def _is_local(target: str) -> bool:
 
 
 def _os_from_ttl(ttl: int) -> str:
+    # rough OS guess based on default TTL values
     if ttl <= 0:
         return "unknown"
     if ttl <= 64:
@@ -113,6 +118,7 @@ def _os_from_ttl(ttl: int) -> str:
 
 
 def _parse_ports(spec: str) -> list[int]:
+    # accepts "22,80,100-200,443" style input
     ports = []
     for part in spec.split(","):
         part = part.strip()
@@ -258,6 +264,7 @@ def _ping_sweep_threaded(network: str, timeout: float = 2.0, retries: int = 1) -
 
 
 def discover_hosts(network: str, timeout: float = 2.0, retries: int = 1) -> list[Host]:
+    # tries ARP first (LAN only), falls back to ICMP ping sweep
     if not HAS_SCAPY:
         console.print("[red]scapy not installed — pip install scapy[/red]")
         return []
@@ -278,6 +285,7 @@ def _resolve_service(port: int) -> str:
 
 
 def _grab_banner(ip: str, port: int, timeout: float = 2.0) -> str:
+    # connect and read the first bytes the service sends back
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
@@ -291,6 +299,7 @@ def _grab_banner(ip: str, port: int, timeout: float = 2.0) -> str:
 
 
 def _scan_single_syn(target: str, port: int, timeout: float) -> PortResult:
+    # SYN scan: send SYN, read reply flags, send RST to close the half-open connection
     pkt = IP(dst=target) / TCP(dport=port, flags="S")
     start = time.perf_counter()
     reply = sr1(pkt, timeout=timeout)
@@ -300,10 +309,10 @@ def _scan_single_syn(target: str, port: int, timeout: float) -> PortResult:
         state = PortState.FILTERED
     elif reply.haslayer(TCP):
         flags = int(reply[TCP].flags)
-        if (flags & 0x02) and not (flags & 0x04):
+        if (flags & 0x02) and not (flags & 0x04):  # SYN-ACK
             state = PortState.OPEN
             sr1(IP(dst=target) / TCP(dport=port, flags="R"), timeout=0.5)
-        elif flags & 0x04:
+        elif flags & 0x04:  # RST
             state = PortState.CLOSED
         else:
             state = PortState.FILTERED
@@ -314,6 +323,7 @@ def _scan_single_syn(target: str, port: int, timeout: float) -> PortResult:
 
 
 def _scan_single_connect(target: str, port: int, timeout: float) -> PortResult:
+    # unprivileged fallback using a full TCP connect
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     state = PortState.FILTERED
@@ -336,10 +346,12 @@ def _scan_single_connect(target: str, port: int, timeout: float) -> PortResult:
 
 def scan_ports_threaded(target: str, ports: list[int], timeout: float = 2.0,
                         progress_cb=None) -> list[PortResult]:
+    # SYN scan needs root and scapy, otherwise falls back to connect scan
     use_syn = _is_root() and HAS_SCAPY
     scan_fn = _scan_single_syn if use_syn else _scan_single_connect
     results: list[PortResult] = []
 
+    # lower worker count for SYN to avoid flooding the network
     workers = min(10, len(ports)) if use_syn else min(MAX_THREADS, len(ports))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
