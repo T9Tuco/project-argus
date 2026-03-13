@@ -1,49 +1,50 @@
-# project argus
+# argus
 
-this is early. there's a lot more planned — proper os fingerprinting, udp scanning, traceroute, export formats, a tui dashboard, scheduled monitoring with alerting, ipv6. treat this as v0.2 of something that's going to keep growing for a while.
-```
-note: its really buggy atm, you can make pull request if you want to help me :)
-```
+a python-based network scanner and monitor built for the terminal. no packaging, no install wizard, no electron app that opens a browser tab for some reason. clone, install two deps, run. uses scapy for raw packet operations and rich for output. everything is threaded so scans on real subnets are actually fast.
+
+> this is v0.2. a lot more is planned — udp scanning, traceroute, real os fingerprinting, a tui dashboard, alerting, ipv6. treat it accordingly and don't rely on it to pass a pentest certification just yet.
+
 ---
 
-a python-based network scanner and monitor. no packaging, no install step — clone, install two deps, done. uses scapy for raw packet operations and rich for terminal output. everything is threaded so scans on real-sized subnets are actually fast.
-
-## dependencies
+## requirements
 
 ```
 pip install scapy rich
 ```
 
-most features need root/admin for raw socket access. the tool checks this upfront and tells you what to run.
+most features need root for raw socket access. the tool checks this upfront and tells you exactly what to run instead of just crashing mysteriously.
 
-## install as system command
+---
+
+## install
 
 ```bash
 git clone https://github.com/T9Tuco/project-argus.git
 cd project-argus
 pip install scapy rich
-sudo ln -sf "$PWD/argus.py" /usr/local/bin/argus.py
-sudo ln -sf "$PWD/argus" /usr/local/bin/argus
-sudo chmod +x /usr/local/bin/argus
-```
-
-after that, `argus` works from anywhere. or just use the included script:
-
-```bash
 bash install.sh
 ```
 
+`install.sh` symlinks `argus` and `argus.py` into `/usr/local/bin` so the command works from anywhere and repo updates are picked up automatically.
+
 ---
 
-## interactive mode
+## usage
 
-run `argus` with no arguments to get a menu-driven interface — no need to remember commands:
+run without arguments to get an interactive menu — useful when you don't want to look up flags at 2am:
 
 ```
 argus
 ```
 
-you'll get a numbered menu to pick what you want to do, then it asks for the target, options, etc. step by step. good for quick one-off scans without looking up flags.
+or use subcommands directly if you know what you want:
+
+```
+sudo argus discover 192.168.1.0/24
+sudo argus scan 192.168.1.1
+sudo argus ping 8.8.8.8
+sudo argus monitor 192.168.1.0/24
+```
 
 ---
 
@@ -51,15 +52,15 @@ you'll get a numbered menu to pick what you want to do, then it asks for the tar
 
 ### discover
 
-arp/icmp sweep to find live hosts on a subnet. parallel on large ranges.
+arp/icmp sweep to find live hosts on a subnet. useful for "what is even on this network" moments.
 
-```
+```bash
 sudo argus discover 192.168.1.0/24
 sudo argus discover 10.0.0.0/8 --timeout 3 --retries 2
 sudo argus discover 192.168.0.0/24 --json
 ```
 
-uses arp for local (rfc1918) subnets — fast and doesn't depend on icmp being unfiltered. falls back to threaded icmp ping sweep for remote subnets or if arp returns nothing.
+uses arp for private (rfc1918) subnets — fast and doesn't depend on icmp being unfiltered. falls back to a threaded icmp ping sweep if arp returns nothing or the target is remote.
 
 output: ip, mac, avg rtt, os hint (ttl-based), status.
 
@@ -69,7 +70,7 @@ output: ip, mac, avg rtt, os hint (ttl-based), status.
 
 tcp port scan. accepts ips, hostnames, and full urls.
 
-```
+```bash
 sudo argus scan 192.168.1.1
 sudo argus scan 192.168.1.1 --deep
 sudo argus scan 192.168.1.1 -p 22,80,100-200,443
@@ -77,94 +78,99 @@ sudo argus scan github.com -b
 sudo argus scan https://example.com --json
 ```
 
-**port specs:**
-- `-p 22,80,443` — specific ports
-- `-p 100-200` — range
-- `-p 22,80,100-200,443` — mix
-- `--deep` — all ports 1–1024
+**port specs**
 
-**`-b` / `--banner`** — after finding open ports, connects and reads the first 80 chars of the service response. works for ssh, http, ftp, smtp etc.
+| flag | example | result |
+|---|---|---|
+| `-p` | `22,80,443` | specific ports |
+| `-p` | `100-200` | range |
+| `-p` | `22,80,100-200,443` | mixed |
+| `--deep` | | all ports 1–1024 |
+| _(none)_ | | 26 common ports |
 
-**scan modes:**
-- with root + scapy: tcp syn (half-open). fast, low-noise.
-- without root: tcp connect(). slower, but no privileges needed.
+**`-b` / `--banner`** — after finding open ports, connects and reads the first 80 chars of whatever the service says about itself. works for ssh, http, ftp, smtp, etc. some services stay quiet, that's fine too.
 
-both modes are threaded. syn scan uses up to 10 parallel workers (scapy shared-socket limitation), connect scan up to 50.
+**scan modes**
 
-output: port, state (open/filtered), service name, banner, rtt.
+| mode | when | notes |
+|---|---|---|
+| tcp syn (half-open) | root + scapy | fast, low noise, max 10 workers |
+| tcp connect | no root or no scapy | slower, up to 50 workers |
+
+output: port, state (open / filtered), service name, banner, rtt.
 
 ---
 
 ### ping
 
-icmp echo with per-packet output and a stats summary.
+icmp echo with per-packet output and a stats summary at the end. basically `ping` but it looks nicer and outputs json if you ask nicely.
 
-```
+```bash
 sudo argus ping 8.8.8.8
 sudo argus ping 8.8.8.8 -c 20
 sudo argus ping google.com --timeout 1
 sudo argus ping 1.1.1.1 --json
 ```
 
-only counts icmp echo reply (type 0) as success — "port unreachable" and other icmp error responses are correctly counted as failures.
+only icmp echo reply (type 0) counts as success. other icmp responses (port unreachable, ttl exceeded, etc.) are correctly counted as loss, not silently ignored.
 
-output: per-packet seq/status/rtt, then min/avg/max rtt, jitter, packet loss.
+output: seq / status / rtt per packet, then min / avg / max / jitter / loss summary.
 
 ---
 
 ### monitor
 
-continuous network monitoring. runs discover + latency checks in a loop.
+continuous host monitoring. runs discovery and latency checks on a loop until you tell it to stop.
 
-```
+```bash
 sudo argus monitor 192.168.1.0/24
 sudo argus monitor 192.168.1.0/24 --interval 60
 sudo argus monitor 10.0.0.0/24 -i 10 --timeout 1
 ```
 
-each sweep: finds all live hosts, then pings each known host in parallel to update rtt and alive status. hosts that go down stay in the table marked as down so you can see the change.
+each sweep discovers live hosts and pings every known host in parallel. hosts that go down stay in the table marked as down — so you can see exactly when your raspberry pi decided to take a nap. stop with `ctrl+c`.
 
 ---
 
-## all flags
+## flags
 
 | flag | commands | default | description |
 |---|---|---|---|
 | `-t` / `--timeout` | all | `2.0` | per-probe timeout in seconds |
 | `-r` / `--retries` | discover | `1` | retries per probe |
+| `-p` / `--ports` | scan | | port spec: `22,80,100-200,443` |
 | `--deep` | scan | off | scan ports 1–1024 |
-| `-p` / `--ports` | scan | — | port spec: `22,80,100-200,443` |
-| `-b` / `--banner` | scan | off | grab service banners on open ports |
+| `-b` / `--banner` | scan | off | grab banners on open ports |
 | `-c` / `--count` | ping | `10` | number of icmp echo requests |
 | `-i` / `--interval` | monitor | `30.0` | seconds between sweeps |
-| `--json` | discover, scan, ping | off | json output |
-| `--version` | — | — | print version and exit |
+| `--json` | discover, scan, ping | off | machine-readable json output |
+| `--version` | | | print version and exit |
 
 ---
 
 ## privileges
 
-| command | needs root | why |
+| command | needs root | reason |
 |---|---|---|
-| `discover` | yes | arp and icmp need raw sockets |
-| `scan` (syn) | yes | raw tcp packet crafting |
-| `scan` (connect) | no | uses normal tcp connect() |
+| `discover` | yes | arp and icmp require raw sockets |
+| `scan` (syn) | yes | raw tcp packet crafting via scapy |
+| `scan` (connect) | no | normal tcp connect() |
 | `ping` | yes | raw icmp sockets |
-| `monitor` | yes | uses discover + ping internally |
+| `monitor` | yes | uses discover and ping internally |
 
 ---
 
-## target input
+## target formats
 
 all commands accept ips, hostnames, and urls:
 
-```
-argus scan https://github.com       # strips to github.com, resolves dns
-argus ping google.com               # dns resolved automatically
-argus scan 10.0.0.1                 # used as-is
+```bash
+argus scan https://github.com    # strips scheme, resolves dns
+argus ping google.com            # resolved automatically
+argus scan 10.0.0.1              # used as-is
 ```
 
-`discover` and `monitor` require cidr notation — hostnames are rejected with a clear message.
+`discover` and `monitor` require cidr notation — hostnames are rejected with a clear error message.
 
 ---
 
@@ -180,7 +186,7 @@ sudo argus ping 8.8.8.8 --json | jq '.avg_ms'
 
 ## os fingerprinting
 
-rough guess based on ip ttl from icmp replies:
+rough guess based on ttl from icmp replies. it's not nmap, but it's something:
 
 | ttl range | guess |
 |---|---|
@@ -188,24 +194,32 @@ rough guess based on ip ttl from icmp replies:
 | 65–128 | windows |
 | 129+ | network device |
 
-proper fingerprinting (tcp window size, options analysis) is on the roadmap.
+proper fingerprinting via tcp stack analysis is on the roadmap.
 
 ---
 
-## what's coming
+## roadmap
 
 - udp scanning
 - traceroute with per-hop latency
-- real os fingerprinting via tcp stack analysis
-- service version detection improvements
+- real os fingerprinting via tcp window / options analysis
+- service version detection
 - exportable reports (json, csv, html)
-- tui dashboard (textual)
+- tui dashboard
 - scheduled monitoring with alerting
 - ipv6 support
-- config file (~/.argusrc)
+- config file (`~/.argusrc`)
+
+---
+
+## contributing
+
+pull requests welcome. if something is broken or behaves weirdly, open an issue and describe what happened — "it doesn't work" is not enough information, but you probably already knew that.
 
 ---
 
 ## license
+
+mit## license
 
 mit
