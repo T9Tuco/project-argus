@@ -1,7 +1,9 @@
 # project argus
 
 this is early. there's a lot more planned — proper os fingerprinting, udp scanning, traceroute, export formats, a tui dashboard, scheduled monitoring with alerting, ipv6. treat this as v0.2 of something that's going to keep growing for a while.
-
+```
+note: its really buggy atm, you can make pull request if you want to help me :)
+```
 ---
 
 a python-based network scanner and monitor. no packaging, no install step — clone, install two deps, done. uses scapy for raw packet operations and rich for terminal output. everything is threaded so scans on real-sized subnets are actually fast.
