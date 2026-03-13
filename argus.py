@@ -578,7 +578,7 @@ def _interactive() -> None:
         console.print("[bold cyan]What do you want to do?[/bold cyan]\n")
         console.print("  [bold white]1[/bold white]  Discover hosts on a network")
         console.print("  [bold white]2[/bold white]  Scan ports on a host")
-        console.print("  [bold white]3[/bold white]  Scan ports via Tor (anonymous)")
+        console.print("  [bold white]3[/bold white]  Scan ports via Tor  [dim](anonymous — needs PySocks + Tor on 9050/9150)[/dim]")
         console.print("  [bold white]4[/bold white]  Ping a host (latency stats)")
         console.print("  [bold white]5[/bold white]  Monitor a network (continuous)")
         console.print("  [bold white]6[/bold white]  Exit")
@@ -929,7 +929,22 @@ def cmd_monitor(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="argus", description="Network scanner and monitor. Run without arguments for interactive mode.")
+    top_epilog = (
+        "Tor anonymous scanning:\n"
+        "  argus scan <target> --tor\n"
+        "\n"
+        "  requires: pip install PySocks  +  Tor running on port 9050 or 9150\n"
+        "  Linux:    sudo apt install tor && sudo systemctl start tor\n"
+        "  Windows:  install Tor Browser or Expert Bundle and launch it\n"
+        "\n"
+        "  run 'argus scan --help' for full Tor usage and examples."
+    )
+    p = argparse.ArgumentParser(
+        prog="argus",
+        description="Network scanner and monitor. Run without arguments for interactive mode.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=top_epilog,
+    )
     p.add_argument("--version", action="version", version=f"argus {ARGUS_VERSION}")
     sub = p.add_subparsers(dest="command")
 
