@@ -73,6 +73,7 @@ def _check_version() -> Optional[str]:
 
 
 _real_socket = socket.socket
+_tor_thread_data = thread_local()
 
 
 def _tor_identity() -> str:
