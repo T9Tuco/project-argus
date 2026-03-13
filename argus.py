@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-"""
-Project Argus — network scanner and monitor.
-
-Usage:
-    argus                                  # interactive mode
-    argus discover <network>
-    argus scan <target> [--deep] [-p 22,80-100,443]
-    argus ping <target> [-c 10]
-    argus monitor <network>
-"""
 
 from __future__ import annotations
 
@@ -48,10 +37,6 @@ except ImportError:
 MAX_THREADS = 50
 
 
-# ---------------------------------------------------------------------------
-# platform helpers
-# ---------------------------------------------------------------------------
-
 def _is_root() -> bool:
     if platform.system() == "Windows":
         try:
@@ -75,10 +60,6 @@ def _bail_no_privs(action: str) -> None:
 
 
 def _resolve_target(raw: str, expect_network: bool = False) -> str:
-    """
-    Normalise user input to an IP or CIDR string.
-    Strips URL schemes/paths, resolves hostnames.
-    """
     if "://" in raw:
         parsed = urllib.parse.urlparse(raw)
         raw = parsed.hostname or raw
@@ -111,7 +92,6 @@ def _resolve_target(raw: str, expect_network: bool = False) -> str:
 
 
 def _is_local(target: str) -> bool:
-    """Check if a network/ip falls within private address space."""
     try:
         net = ipaddress.ip_network(target, strict=False)
         return net.is_private and not net.is_loopback
@@ -133,10 +113,6 @@ def _os_from_ttl(ttl: int) -> str:
 
 
 def _parse_ports(spec: str) -> list[int]:
-    """
-    Parse port specification: '22,80,100-200,443'
-    Supports individual ports and ranges.
-    """
     ports = []
     for part in spec.split(","):
         part = part.strip()
@@ -162,10 +138,6 @@ def _parse_ports(spec: str) -> list[int]:
                 sys.exit(1)
     return sorted(set(ports))
 
-
-# ---------------------------------------------------------------------------
-# data types
-# ---------------------------------------------------------------------------
 
 @dataclass
 class Host:
@@ -238,20 +210,12 @@ class LatencyStats:
         return sum(diffs) / len(diffs)
 
 
-# ---------------------------------------------------------------------------
-# common ports
-# ---------------------------------------------------------------------------
-
 TOP_PORTS = [
     21, 22, 23, 25, 53, 80, 110, 111, 135, 139,
     143, 443, 445, 993, 995, 1723, 3306, 3389, 5432,
     5900, 6379, 8000, 8080, 8443, 8888, 27017,
 ]
 
-
-# ---------------------------------------------------------------------------
-# discovery
-# ---------------------------------------------------------------------------
 
 def _arp_sweep(network: str, timeout: float = 2.0) -> list[Host]:
     net = ipaddress.ip_network(network, strict=False)
@@ -284,8 +248,6 @@ def _ping_sweep_threaded(network: str, timeout: float = 2.0, retries: int = 1) -
     addrs = [str(a) for a in net.hosts()]
     hosts: list[Host] = []
 
-    # scapy isn't fully thread-safe for sr1, but for independent
-    # packets to different IPs it works fine in practice
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as pool:
         futures = {pool.submit(_ping_one, ip, timeout, retries): ip for ip in addrs}
         for future in concurrent.futures.as_completed(futures):
@@ -308,10 +270,6 @@ def discover_hosts(network: str, timeout: float = 2.0, retries: int = 1) -> list
     return hosts
 
 
-# ---------------------------------------------------------------------------
-# port scanning
-# ---------------------------------------------------------------------------
-
 def _resolve_service(port: int) -> str:
     try:
         return socket.getservbyport(port, "tcp")
@@ -320,7 +278,6 @@ def _resolve_service(port: int) -> str:
 
 
 def _grab_banner(ip: str, port: int, timeout: float = 2.0) -> str:
-    """Try to grab a service banner from an open port."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
@@ -343,10 +300,10 @@ def _scan_single_syn(target: str, port: int, timeout: float) -> PortResult:
         state = PortState.FILTERED
     elif reply.haslayer(TCP):
         flags = int(reply[TCP].flags)
-        if (flags & 0x02) and not (flags & 0x04):  # SYN bit set, RST not set -> SYN-ACK
+        if (flags & 0x02) and not (flags & 0x04):
             state = PortState.OPEN
             sr1(IP(dst=target) / TCP(dport=port, flags="R"), timeout=0.5)
-        elif flags & 0x04:  # RST or RST-ACK -> closed
+        elif flags & 0x04:
             state = PortState.CLOSED
         else:
             state = PortState.FILTERED
@@ -379,16 +336,10 @@ def _scan_single_connect(target: str, port: int, timeout: float) -> PortResult:
 
 def scan_ports_threaded(target: str, ports: list[int], timeout: float = 2.0,
                         progress_cb=None) -> list[PortResult]:
-    """
-    Scan ports with threading. Uses SYN when root, connect otherwise.
-    progress_cb is called after each port completes (for progress bar).
-    """
     use_syn = _is_root() and HAS_SCAPY
     scan_fn = _scan_single_syn if use_syn else _scan_single_connect
     results: list[PortResult] = []
 
-    # SYN scan with scapy isn't safe to parallelize heavily since scapy
-    # uses a shared socket; limit threads for SYN, go wide for connect
     workers = min(10, len(ports)) if use_syn else min(MAX_THREADS, len(ports))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -402,10 +353,6 @@ def scan_ports_threaded(target: str, ports: list[int], timeout: float = 2.0,
     results.sort(key=lambda r: r.port)
     return results
 
-
-# ---------------------------------------------------------------------------
-# latency
-# ---------------------------------------------------------------------------
 
 def measure_latency(target: str, count: int = 10, timeout: float = 2.0, interval: float = 0.5) -> LatencyStats:
     if not HAS_SCAPY:
@@ -426,10 +373,6 @@ def measure_latency(target: str, count: int = 10, timeout: float = 2.0, interval
             time.sleep(interval)
     return stats
 
-
-# ---------------------------------------------------------------------------
-# display
-# ---------------------------------------------------------------------------
 
 def _banner() -> None:
     colors = [
@@ -511,10 +454,6 @@ def _show_latency(stats: LatencyStats) -> None:
     tbl.add_row("Jitter", f"{stats.jitter_ms:.2f} ms")
     console.print(tbl)
 
-
-# ---------------------------------------------------------------------------
-# interactive mode
-# ---------------------------------------------------------------------------
 
 def _interactive() -> None:
     _banner()
@@ -698,10 +637,6 @@ def _interactive_monitor() -> None:
         console.print("\n[yellow]Stopped.[/yellow]")
 
 
-# ---------------------------------------------------------------------------
-# cli commands
-# ---------------------------------------------------------------------------
-
 def cmd_discover(args: argparse.Namespace) -> None:
     args.target = _resolve_target(args.target, expect_network=True)
     _bail_no_privs("Host discovery")
@@ -741,7 +676,6 @@ def cmd_scan(args: argparse.Namespace) -> None:
 
         scan_ports_threaded(args.target, ports, timeout=args.timeout, progress_cb=on_result)
 
-    # banner grab on open ports
     if args.banner:
         open_results = [r for r in results if r.state == PortState.OPEN]
         if open_results:
@@ -838,10 +772,6 @@ def cmd_monitor(args: argparse.Namespace) -> None:
         console.print("\n[yellow]Stopped.[/yellow]")
 
 
-# ---------------------------------------------------------------------------
-# arg parser
-# ---------------------------------------------------------------------------
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="argus", description="Network scanner and monitor. Run without arguments for interactive mode.")
     p.add_argument("--version", action="version", version="argus 0.2.0")
@@ -879,7 +809,6 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    # no subcommand → interactive mode
     if args.command is None:
         _interactive()
         return
@@ -895,3 +824,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
